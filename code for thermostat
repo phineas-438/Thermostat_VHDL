@@ -1,0 +1,213 @@
+LIBRARY IEEE;
+USE IEEE.std_logic_1164.all;
+USE IEEE.std_logic_unsigned.all;
+
+entity THERMOSTAT is
+	port(
+		--Inputs
+		current_temp : in std_logic_vector(6 downto 0);	 --actual temperature of the sensor
+		desired_temp : in std_logic_vector(6 downto 0);	 --set value for temperature in room
+		display_select : in std_logic;					 --selection of hmi display
+		cool : in std_logic;							 --Cooling enable switch hmi
+		heat : in std_logic;							 --Heater enable switch hmi
+		furnace_hot : in std_logic;						 --Feedback signal from the heater, 1=ready for operation
+		ac_ready : in std_logic;						 --Feedback signal from the ac, 1=ready for operation
+		clk : in std_logic;								 --Clk input signal of the fpga
+		rst : in std_logic;							 --reset signal of the Hardware
+		--Outputs
+		temp_display : out std_logic_vector(6 downto 0); --Temperature value of hmi display
+		ac_on : out std_logic;							 --Switch the external ac on	
+		furnace_on : out std_logic;						 --Switch the external heater on	
+		fan_on : out std_logic						 	 --Switch the external fan on	
+		);
+end THERMOSTAT;
+
+architecture RTL of THERMOSTAT is
+	
+	--FSM 
+	type state_type is (IDLE, RESET, HEAT_REQUEST, HEAT_OUTPUT, HEAT_EXIT, COOL_REQUEST, COOL_OUTPUT, COOL_EXIT);
+	signal state 	: state_type;
+	
+	
+	--Input registers and logic
+	signal reg_current_temp, reg_desired_temp : std_logic_vector(6 downto 0);
+	signal reg_display_select, reg_cool, reg_heat : std_logic;
+	signal reg_furnace_hot, reg_ac_ready : std_logic;	--Better: use prefix reg_ also for std_logic
+	
+	--Help/Intermediate registers and signals
+	signal reg_Display_port_out : std_logic_vector(6 downto 0);
+	signal reg_ac_on, reg_furnace_on : std_logic;
+	signal reg_fan_on : std_logic;
+	signal reg_fsm_count : std_logic_vector(5 downto 0);
+	
+begin
+	
+	--=============Register Inputs=======================
+	INPUT_REGISTERS: process (clk, rst)
+	begin
+		if rst = '1' then 
+			--reset condition
+				reg_current_temp 		<= (others => '0');
+				reg_desired_temp 		<= (others => '0');
+				reg_display_select		<= '0';
+				reg_cool				<= '0';
+				reg_heat				<= '0';
+				reg_furnace_hot			<= '0';
+				reg_ac_ready			<= '0';
+				
+			
+			elsif clk'event and clk= '1' then
+			--normal operation
+				reg_current_temp 	<= current_temp;
+				reg_desired_temp	<= desired_temp;
+				reg_display_select	<= display_select;
+				reg_cool			<= cool;
+				reg_heat			<= heat;
+				reg_furnace_hot		<= furnace_hot;
+				reg_ac_ready		<= ac_ready;				
+			else		
+			--nop, no operation without clk
+			end if;
+	end process;
+
+
+
+	--=============FSM=====================
+	FSM: process (clk)
+	begin
+		--if reset = '1' then
+		--	current_state <= IDLE;	
+		if clk'event and clk = '1' then
+				case state is 
+					when RESET =>
+						--Output Regs
+						reg_fsm_count <= (others => '0');
+						reg_fan_on <= '0';
+						reg_furnace_on <= '0';
+						reg_ac_on <= '0';
+						
+						--State transition
+						state <= IDLE;
+					
+					when IDLE =>
+						--Output Regs
+						reg_fan_on <= '0';
+						reg_furnace_on <= '0';
+						reg_ac_on <= '0';
+
+						--State transition
+						if reg_heat = '1' and reg_current_temp < reg_desired_temp then
+							state <= HEAT_REQUEST;
+						elsif reg_cool = '1' and reg_current_temp > reg_desired_temp then
+							state <= COOL_REQUEST;
+						-- nop;
+						end if;
+					-- HEATING OPERATIONS
+					when HEAT_REQUEST =>
+						--Output Regs
+						reg_fan_on <= '0';
+						reg_furnace_on <= '1';
+						reg_fsm_count <= "001010";-->dec10			--Start countdown 10 clk cycles to procees to IDLE state
+						
+						--State transition
+						if reg_heat = '1' and reg_furnace_hot = '1' then
+							state <= HEAT_OUTPUT;
+						elsif reg_heat = '0' then
+							state <= HEAT_EXIT;
+						else
+						--nop;
+						end if;
+					when HEAT_OUTPUT =>
+						--Output Regs
+						reg_fan_on <= '1';					
+						reg_furnace_on <= '1';
+						
+						--State transition
+						if ((reg_heat = '0') or (reg_current_temp >= reg_desired_temp)) then
+							state <= HEAT_EXIT;
+						else
+						--nop;
+						end if;
+					when HEAT_EXIT =>
+						--Output Regs
+						reg_fan_on <= '1';
+						reg_furnace_on <= '0';
+						reg_fsm_count <= reg_fsm_count - 1 ;  		--Decrement counter
+					
+						--State transition
+						if reg_furnace_hot = '0' and reg_fsm_count = "00000" then
+							state <= IDLE;
+						else
+						--nop;
+						end if;
+					--COOLING OPERATIONS
+					when COOL_REQUEST =>
+						--Output Regs
+						reg_fan_on <= '0';
+						reg_fsm_count <= "010100";-->dec20			--Start countdown 20 clk cycles to procees to IDLE state
+						reg_ac_on <= '1';	
+						
+						--State transition
+						if reg_cool = '1' and reg_ac_ready = '1' then
+							state <= COOL_OUTPUT;
+						elsif reg_cool = '0' then
+							state <= COOL_EXIT;
+						end if;
+					when COOL_OUTPUT =>
+						--Output Regs
+						reg_fan_on <= '1';
+						reg_ac_on <= '1';
+						
+						--State transition
+						if reg_desired_temp >= reg_current_temp or reg_cool = '0' then
+							state <= COOL_EXIT;
+						else
+							--nop
+						end if;
+					when COOL_EXIT =>
+						--Output Regs
+						reg_fsm_count <= reg_fsm_count - 1 ;  		--Decrement counter				
+						reg_fan_on <= '1';
+						reg_ac_on <= '0';
+					
+						--State transition
+						if reg_ac_ready = '0' and reg_fsm_count = "00000" then
+							state <= IDLE;
+						else
+						--nop;
+						end if;
+					when others =>
+						state <= RESET;
+				end case;
+
+		elsif rst = '1' then
+			state <= RESET;
+			--nop;
+		end if;
+		
+		fan_on <= reg_fan_on;
+		furnace_on <= reg_furnace_on;
+		ac_on <= reg_ac_on;
+	end process FSM;
+
+	--=============Display selection=======================
+	--Concurrent statement for display selection
+	reg_Display_port_out <= reg_current_temp when (reg_display_select = '1') else
+					reg_desired_temp;
+
+	--Reg Display select changes the output
+	DISPLAY: process (clk, rst)
+	begin
+		if rst = '1' then 
+			--reset condition
+			elsif clk'event and clk= '1' then
+			--normal operation
+			temp_display <= reg_Display_port_out;
+			else		
+			--nop, no operation without clk
+			end if;
+	end process;
+	
+	
+			
+end RTL;
